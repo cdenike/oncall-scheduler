@@ -1,0 +1,222 @@
+# Builds a Windows .exe and a Linux binary, because PyInstaller cannot
+# cross-compile: each one has to be built on the system it targets, and these
+# runners are that system without anyone keeping a machine for it.
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:        # so a build can be tried without tagging one
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: OnCallScheduler-windows
+            binary: dist/OnCallScheduler.exe
+            # Recognition is bundled here, so it must be found.
+            strict: --strict
+            display: ""
+            # The native look is a plugin; without it Qt falls back to a
+            # generic style that looks like nothing else on Windows.
+            style: "windows11|windowsvista"
+          - os: ubuntu-latest
+            artifact: OnCallScheduler-linux
+            binary: dist/OnCallScheduler
+            # Strict here too: the runner has tesseract installed, which is
+            # what a Linux user has, and a build that cannot read a calendar
+            # with it present is broken rather than merely unbundled.
+            strict: --strict
+            display: xvfb-run -a
+            style: ""
+    runs-on: ${{ matrix.os }}
+    # Lifted out of `secrets` because a step's `if` cannot read that context,
+    # and each signing route below has to know whether it was configured.
+    env:
+      SIGN_ENDPOINT: ${{ secrets.SIGNING_ENDPOINT }}
+      SIGN_ACCOUNT: ${{ secrets.SIGNING_ACCOUNT }}
+      SIGN_PROFILE: ${{ secrets.SIGNING_PROFILE }}
+      SIGN_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # PySide6-Essentials is the half of PySide6 with QtWidgets in it. The
+      # other half -- WebEngine, 3D, multimedia, PDF -- is 168 MB to download
+      # on Windows, and nothing here uses any of it.
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip PySide6-Essentials Pillow pyinstaller
+
+      # Only tesseract and what it links against. The Windows install also
+      # carries its training tools' dependencies, ICU among them: half its
+      # size, and none of it needed to recognise text.
+      - name: Collect tesseract (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install tesseract --no-progress -y
+          python tools/collect_tesseract.py
+
+      # Linux takes recognition from the package manager rather than carrying
+      # it: bundling it meant a second copy of ICU, 35 MB of it, beside the one
+      # Qt already brings -- and unlike Windows, a Linux desktop installs a
+      # package with one command. The runner installs it so the check below
+      # still exercises reading a calendar, which is the configuration a Linux
+      # user actually runs.
+      - name: Install tesseract (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            tesseract-ocr tesseract-ocr-eng
+
+      # What goes in, and what is left out and why, is in the spec.
+      - name: Build
+        run: pyinstaller --noconfirm --clean OnCallScheduler.spec
+
+      # Windows names the publisher of a program it is asked to run, and
+      # says "unknown publisher" until the file carries an Authenticode
+      # signature. Nothing else in the build stands in for one -- not the
+      # icon, not the version resource, not the name of the file -- so this is
+      # the only step that changes what that prompt says. See SIGNING.md.
+      #
+      # Two routes, either of which produces the same result. Whichever is
+      # configured runs; with neither, the build goes out unsigned, which is
+      # what it has always done.
+
+      # The hosted route. Azure Artifact Signing (until recently Trusted
+      # Signing) keeps the key and issues a short-lived certificate per
+      # signature, so there is a subscription to hold rather than a
+      # certificate file to guard -- and since keys were required to live in
+      # hardware, it is the route an individual can actually take. Set
+      # SIGNING_ENDPOINT, SIGNING_ACCOUNT and SIGNING_PROFILE, and the three
+      # AZURE_* secrets of an app registration allowed to sign.
+      - name: Sign the executable, hosted (Windows)
+        if: runner.os == 'Windows' && env.SIGN_ENDPOINT != ''
+        uses: Azure/artifact-signing-action@v2
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.SIGNING_PROFILE }}
+          files-folder: dist
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-digest: SHA256
+
+      # The certificate route, for a certificate held directly rather than
+      # rented: WINDOWS_CERT_PFX (the file, base64) and WINDOWS_CERT_PASSWORD.
+      # Skipped when the hosted route already signed it.
+      - name: Sign the executable, certificate (Windows)
+        if: runner.os == 'Windows' && env.SIGN_ENDPOINT == '' && env.SIGN_PFX != ''
+        shell: pwsh
+        env:
+          CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "signing.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGN_PFX))
+          $tool = Get-ChildItem "C:/Program Files (x86)/Windows Kits/10/bin" `
+            -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -like "*x64*" } |
+            Select-Object -First 1 -ExpandProperty FullName
+          # Timestamped, so the signature outlives the certificate rather than
+          # expiring with it.
+          & $tool sign /f $pfx /p $env:CERT_PASSWORD /fd SHA256 `
+            /tr http://timestamp.digicert.com /td SHA256 dist/OnCallScheduler.exe
+          Remove-Item $pfx
+          if ($LASTEXITCODE -ne 0) { throw "signing failed" }
+
+      # What the prompt will say, in the log, on every build. An unsigned
+      # build says so plainly rather than failing: that is a configuration
+      # choice, not a broken build. A signature that does not verify is a
+      # broken build, and fails here.
+      - name: Report the publisher (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature dist/OnCallScheduler.exe
+          if ($sig.Status -eq "NotSigned") {
+            Write-Host "Unsigned: Windows will say 'Unknown publisher'."
+            Write-Host "See SIGNING.md for what to configure."
+            exit 0
+          }
+          $name = $sig.SignerCertificate.Subject -replace '^CN=([^,]+).*$', '$1'
+          Write-Host "Signed. Windows will name the publisher: $name"
+          Write-Host "Certificate: $($sig.SignerCertificate.Subject)"
+          Write-Host "Timestamp:   $($sig.TimeStamperCertificate.Subject)"
+          if ($sig.Status -ne "Valid") { throw "signature does not verify: $($sig.Status)" }
+          if (-not $sig.TimeStamperCertificate) { throw "signature is not timestamped" }
+
+      # A display to open the window on, and the libraries Qt takes from the
+      # system rather than the bundle -- GL and EGL above all, which belong to
+      # the graphics driver. Every desktop has them; this runner has no screen,
+      # so it does not.
+      - name: Prepare a display (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            xvfb libegl1 libgl1 libfontconfig1 libdbus-1-3 \
+            libxkbcommon0 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 \
+            libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
+            libxcb-shape0 libxcb-xinerama0 libxcb-xfixes0
+
+      # So the check can only pass on what the build carries. With the
+      # installed copy on PATH, a library missing from the bundle would be
+      # found there instead, and the gap would ship unnoticed.
+      - name: Hide the installed tesseract (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Rename-Item "C:\Program Files\Tesseract-OCR" "Tesseract-OCR.hidden"
+
+
+      # Solves, draws, reads a calendar back and opens the window, in the
+      # build, on the machine it targets. A build that compiled is not a build
+      # that works: this is what catches a missing font, recognition that was
+      # not bundled, or a part of Qt that was left out and should not have been.
+      - name: Check the build works here
+        shell: bash
+        run: |
+          set -e
+          ls -l ${{ matrix.binary }}
+          status=0
+          ${{ matrix.display }} ${{ matrix.binary }} --selftest selftest.txt ${{ matrix.strict }} || status=$?
+          echo "--- what the build reported (exit $status) ---"
+          cat selftest.txt || echo "(no report written)"
+          [ "$status" -eq 0 ]
+          grep -qE "^window: [0-9]+x[0-9]+" selftest.txt
+          if [ -n "${{ matrix.style }}" ]; then
+            grep -qE "style (${{ matrix.style }})" selftest.txt
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.binary }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts }
+      # The notices travel with the binaries, which is what several of the
+      # licences in them ask for.
+      - name: Attach the binaries to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/**/*
+            THIRD-PARTY-NOTICES.md
+            LICENSE
+          generate_release_notes: true

@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+title: On-Call Scheduler
+message: Please cite this work as below.
+type: software
+authors:
+  - family-names: DeNike
+    given-names: Caden
+repository-code: https://github.com/cdenike/oncall-scheduler
+license: GPL-3.0-or-later

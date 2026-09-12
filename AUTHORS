@@ -1,0 +1,16 @@
+Caden DeNike wrote this.
+
+The work is his: the scheduling method, the design of the calendar, the
+reader that takes one back off a picture, and the program around them. His
+copyright notice appears at the top of every source file and in the LICENSE.
+
+Under the GNU General Public License you are welcome to use this, change it
+and pass it on. What you may not do is present it as your own: section 5 of
+the licence requires that a modified version carry prominent notices saying
+you changed it and when, and that it keep the notices already in it. Removing
+them is not a style choice -- it terminates the rights the licence grants,
+under section 8.
+
+Releases are signed, and so are the commits and tags behind them from the
+point signing was set up. A signature proves who published a copy rather than
+who wrote it, but a history signed by somebody else did not come from here.
