@@ -131,6 +131,14 @@ class NameList(QtWidgets.QWidget):
         self.rows.setSpacing(4)
 
     def set_names(self, names):
+        """Adopt a list of names -- by reference, deliberately.
+
+        Every edit below mutates this list in place, so the caller must pass
+        the list the roster actually holds, never a copy and never a literal.
+        Pass `roster["supervisors"]`, not `[]` or `list(...)`: a detached list
+        keeps working, keeps looking right on screen, and silently saves
+        nothing.
+        """
         self.names = names
         self._rebuild()
 
@@ -1162,13 +1170,15 @@ class Window(QtWidgets.QMainWindow):
         the people in it, and so do the exported months: those record what was
         actually worked, and clearing a roster is no reason to forget it.
         """
-        self.roster["supervisors"] = []
+        # Every one of these is emptied in place, never reassigned. The name
+        # lists hold these very objects -- NameList.set_names keeps the
+        # reference and edits through it -- so handing the roster a fresh list
+        # leaves the widget editing the old one, and everything typed
+        # afterwards is written to an orphan that is never saved.
+        self.roster.setdefault("supervisors", []).clear()
         for group in self.roster["groups"]:
-            group["technicians"] = []
-        self.roster["inactive"] = []
-        # Emptied rather than replaced: the supervisors list holds this very
-        # dictionary, and handing the roster a new one would leave the list
-        # editing the old.
+            group.setdefault("technicians", []).clear()
+        self.roster.setdefault("inactive", []).clear()
         self.roster.setdefault("phones", {}).clear()
         roster.save(self.roster)
         for group in self.roster["groups"]:
@@ -1181,7 +1191,11 @@ class Window(QtWidgets.QMainWindow):
         self.export_button.setEnabled(False)
         self.respin_button.setEnabled(False)
         self.tail_button.setVisible(False)
-        self.sup_list.set_names([])
+        # Rebound to the roster's own list, not to a fresh one. Passing []
+        # here was the bug: it detached the supervisor list from the roster, so
+        # supervisors typed in after a clear went nowhere -- while a scanned
+        # import looked fine, because absorbing one re-binds this very widget.
+        self.sup_list.set_names(self.roster["supervisors"])
         self._rebuild_groups()
         self._rebuild_timeoff()
         self.status.setText("Add supervisors and technicians, then press Generate")
