@@ -92,10 +92,10 @@ def describe(dates):
     parts = []
     for start, end in spans(dates):
         if start == end:
-            parts.append(start.strftime("%-d %B"))
+            parts.append("%d %s" % (start.day, start.strftime("%B")))
         elif (start.month, start.year) == (end.month, end.year):
-            parts.append("%d-%s" % (start.day, end.strftime("%-d %B")))
+            parts.append("%d-%d %s" % (start.day, end.day, end.strftime("%B")))
         else:
-            parts.append("%s - %s" % (start.strftime("%-d %b"),
-                                      end.strftime("%-d %b")))
+            parts.append("%d %s - %d %s" % (start.day, start.strftime("%b"),
+                                            end.day, end.strftime("%b")))
     return ", ".join(parts)
